@@ -1,0 +1,281 @@
+esphome:
+  name: esphome-web-fabe29
+  friendly_name: ESPHOME Tester
+  min_version: 2025.9.0
+  name_add_mac_suffix: false
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+  baud_rate: 0
+  
+web_server:
+    
+# Enable Home Assistant API
+api:
+
+# Allow Over-The-Air updates
+ota:
+- platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback AP if Wi-Fi fails
+  ap:
+    ssid: "Inverter"
+    password: ""
+
+  reboot_timeout: 60s
+
+captive_portal:
+  
+uart:
+  id: uart_bus
+  tx_pin: 17
+  rx_pin: 16
+  baud_rate: 2400
+  parity: NONE
+  stop_bits: 1
+  data_bits: 8
+
+# Send telemetry command every second
+interval:
+  - interval: 3s
+    then:
+      # 1) Send the telemetry command
+      - uart.write: !lambda |-
+          static const uint8_t cmd[] = {0x43,0x4D,0x53,0x47,0x06,0x49,0x4E,0x56,0x2D,0x48,0x42};
+          return std::vector<uint8_t>(cmd, cmd + sizeof(cmd));
+
+      # 2) Small wait loop to let bytes arrive (max ~400ms)
+      - lambda: |-
+          int tries = 0;
+          while (id(uart_bus).available() == 0 && tries < 40) {
+            delay(10);
+            tries++;
+          }
+
+          // 3) Read all available bytes and append to accumulator
+          int avail = id(uart_bus).available();
+          if (avail > 0) {
+            std::vector<uint8_t> buffer(avail);
+            id(uart_bus).read_array(buffer.data(), avail);
+
+            // Append as hex to rx_accum
+            char byte_str[3];
+            for (int i = 0; i < avail; i++) {
+              sprintf(byte_str, "%02x", buffer[i]);
+              id(rx_accum) += byte_str;
+            }
+          }
+
+          // 4) Prevent unbounded growth of accumulator
+          const size_t MAX_ACCUM = 1024;  // 512 bytes worth of hex
+          if (id(rx_accum).size() > MAX_ACCUM) {
+            id(rx_accum) = id(rx_accum).substr(id(rx_accum).size() - MAX_ACCUM);
+          }
+
+          // 5) Find the last header
+          const std::string header = "565048";
+          size_t pos = id(rx_accum).rfind(header);
+
+          if (pos != std::string::npos) {
+            const size_t expected_hex_len = 170;  // 85 bytes * 2 chars
+            if (id(rx_accum).size() >= pos + expected_hex_len) {
+              // Extract one normalized frame
+              std::string normalized = id(rx_accum).substr(pos, expected_hex_len);
+
+              // Publish and store
+              id(techhybrid_raw).publish_state(normalized);
+              id(hex_buffer) = normalized;
+
+              // Consume bytes up to the end of the frame
+              id(rx_accum).erase(0, pos + expected_hex_len);
+            } else {
+              // Header found but incomplete
+              id(techhybrid_raw).publish_state("HEADER FOUND, INCOMPLETE");
+              id(hex_buffer).clear();   // ?? clear buffer so sensors go NAN
+            }
+          } else {
+            // No header found
+            id(techhybrid_raw).publish_state("NO DATA");
+            id(hex_buffer).clear();     // ?? clear buffer so sensors go NAN
+          }
+
+
+# Helper function: read and parse buffer
+globals:
+  - id: hex_buffer
+    type: std::string
+    restore_value: no
+    initial_value: ""
+
+  - id: rx_accum
+    type: std::string
+    restore_value: no
+    initial_value: ""
+
+text_sensor:
+  - platform: template
+    name: "TechHybrid Raw Frame"
+    id: techhybrid_raw
+    update_interval: never   # we’ll push updates manually
+
+
+# Sensors
+sensor:
+  - platform: template
+    name: "TechHybrid Input Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      int high = strtol(id(hex_buffer).substr(36,2).c_str(), nullptr, 16);
+      int low  = strtol(id(hex_buffer).substr(34,2).c_str(), nullptr, 16);
+      return (high*256 + low) / 10.0;
+
+  - platform: template
+    name: "TechHybrid Input Frequency"
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      int high = strtol(id(hex_buffer).substr(40,2).c_str(), nullptr, 16);
+      int low  = strtol(id(hex_buffer).substr(38,2).c_str(), nullptr, 16);
+      return (high*256 + low) / 10.0;
+
+  - platform: template
+    name: "TechHybrid Output Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      int high = strtol(id(hex_buffer).substr(44,2).c_str(), nullptr, 16);
+      int low  = strtol(id(hex_buffer).substr(42,2).c_str(), nullptr, 16);
+      return (high*256 + low) / 10.0;
+
+  - platform: template
+    name: "TechHybrid Output Frequency"
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      int high = strtol(id(hex_buffer).substr(48,2).c_str(), nullptr, 16);
+      int low  = strtol(id(hex_buffer).substr(46,2).c_str(), nullptr, 16);
+      return (high*256 + low) / 10.0;
+
+  - platform: template
+    name: "TechHybrid Battery Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      int high = strtol(id(hex_buffer).substr(52,2).c_str(), nullptr, 16);
+      int low  = strtol(id(hex_buffer).substr(50,2).c_str(), nullptr, 16);
+      return (high*256 + low) / 10.0;
+
+  - platform: template
+    name: "TechHybrid Battery Capacity"
+    unit_of_measurement: "%"
+    device_class: battery
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      return strtol(id(hex_buffer).substr(54,2).c_str(), nullptr, 16);
+
+  - platform: template
+    name: "TechHybrid AC Charge Current"
+    unit_of_measurement: "A"
+    device_class: current
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      return strtol(id(hex_buffer).substr(56,2).c_str(), nullptr, 16);
+
+  - platform: template
+    name: "TechHybrid Load Percent"
+    unit_of_measurement: "%"
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      return strtol(id(hex_buffer).substr(58,2).c_str(), nullptr, 16);
+
+  - platform: template
+    name: "TechHybrid Inverter Temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 60) return NAN; 
+      return strtol(id(hex_buffer).substr(60,2).c_str(), nullptr, 16);
+
+  - platform: template
+    name: "TechHybrid PV Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      return strtol(id(hex_buffer).substr(78,2).c_str(), nullptr, 16);
+
+  - platform: template
+    name: "TechHybrid Charge Current"
+    unit_of_measurement: "A"
+    device_class: current
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      int whole = strtol(id(hex_buffer).substr(82,2).c_str(), nullptr, 16);
+      int frac  = strtol(id(hex_buffer).substr(142,2).c_str(), nullptr, 16);
+      return whole + frac/100.0;
+
+  - platform: template
+    name: "TechHybrid PV Power"
+    unit_of_measurement: "W"
+    device_class: power
+    update_interval: 3s
+    lambda: |-
+      if (id(hex_buffer).empty()) return NAN;
+      if (id(hex_buffer).substr(0,6) != "565048") return NAN;
+      if (id(hex_buffer).size() < 170) return NAN; 
+      int high = strtol(id(hex_buffer).substr(52,2).c_str(), nullptr, 16);
+      int low  = strtol(id(hex_buffer).substr(50,2).c_str(), nullptr, 16);
+      float batt_voltage = (high*256 + low) / 10.0;
+      int whole = strtol(id(hex_buffer).substr(82,2).c_str(), nullptr, 16);
+      int frac  = strtol(id(hex_buffer).substr(142,2).c_str(), nullptr, 16);
+      float charge_current = whole + frac/100.0;
+      return batt_voltage * charge_current;
+
+
